@@ -1,8 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const { Sequelize, DataTypes } = require('sequelize');
+const http = require('http'); // <-- 1. Importamos el módulo http
+const { Server } = require('socket.io'); // <-- 2. Importamos Socket.io
 
 const app = express();
+const server = http.createServer(app); // <-- 3. Envolvemos Express en el servidor HTTP
+const io = new Server(server, {
+  cors: { origin: '*' } // Permitimos que cualquier frontend se conecte
+});
+
 app.use(cors()); 
 app.use(express.json()); 
 
@@ -59,45 +66,102 @@ app.get('/api/lugares', async (req, res) => {
 });
 
 app.post('/api/verificar', async (req, res) => {
-  const { uid, id_lugar } = req.body; 
-  if (!uid || !id_lugar) return res.status(400).json({ error: 'Falta UID o ID del Lugar' });
+  try {
+    // El ESP32 debe mandar el UID de la tarjeta y su propio ID de lugar
+    const { uid, lugarId } = req.body;
 
-  const usuario = await Usuario.findOne({ where: { uid: uid } });
-  let estadoAcceso = 'Acceso Denegado', usuarioId = null, nombreUsuario = 'Desconocido';
+    // 1. Buscamos a la persona y al lugar
+    const usuario = await Usuario.findOne({ where: { uid } });
+    const lugar = await Lugar.findByPk(lugarId);
 
-  if (usuario) {
-    estadoAcceso = 'Acceso Permitido';
-    usuarioId = usuario.id;
-    nombreUsuario = usuario.nombre;
-    await usuario.update({ UbicacionActualId: id_lugar });
+    // 2. Si la tarjeta no está registrada -> ACCESO DENEGADO
+    if (!usuario) {
+      await Registro.create({
+        usuarioId: null,
+        lugarId: lugarId || null,
+        estado: 'Acceso Denegado'
+      });
+      io.emit('nueva_lectura'); // Avisar al React
+      return res.json({ acceso: false, mensaje: 'Tarjeta no registrada' });
+    }
+
+    if (!lugar) {
+      return res.status(400).json({ error: 'Lugar no encontrado en el sistema.' });
+    }
+
+    let estadoRegistro = '';
+    let nuevaUbicacion = null;
+
+    // 3. LÓGICA DE ENTRADA Y SALIDA
+    if (usuario.UbicacionActualId === lugar.id) {
+      // SI YA ESTABA AHÍ -> ES UNA SALIDA
+      estadoRegistro = 'Salida';
+      // Magia de la jerarquía: Si sale del "Laboratorio", lo regresamos al "Campus" (padreId).
+      // Si sale del "Campus" (que no tiene padre), queda en null (Fuera del sistema).
+      nuevaUbicacion = lugar.padreId; 
+    } else {
+      // SI NO ESTABA AHÍ -> ES UNA ENTRADA
+      estadoRegistro = 'Entrada';
+      nuevaUbicacion = lugar.id;
+    }
+
+    // 4. Guardar los cambios en la base de datos
+    await usuario.update({ UbicacionActualId: nuevaUbicacion });
+    await Registro.create({
+      usuarioId: usuario.id,
+      lugarId: lugar.id,
+      estado: estadoRegistro
+    });
+
+    // Avisar al React para que actualice las tablas e indicadores al instante
+    io.emit('nueva_lectura');
+
+    // Responder al ESP32 (puedes prender un LED verde para entrada y un LED azul para salida si quieres)
+    res.json({ acceso: true, estado: estadoRegistro, usuario: usuario.nombre });
+
+  } catch (error) {
+    console.error('Error en la lectura:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
+});
 
-  await Registro.create({ uid_leido: uid, estado: estadoAcceso, UsuarioId: usuarioId, LugarId: id_lugar });
-  res.json({ acceso: estadoAcceso === 'Acceso Permitido', mensaje: estadoAcceso, nombre: nombreUsuario });
+app.post('/api/lugares', async (req, res) => {
+  try {
+    const { nombre, tipo, padreId } = req.body;
+    // Si el padreId viene vacío, lo guardamos como null (nivel raíz)
+    const nuevoLugar = await Lugar.create({ 
+      nombre, 
+      tipo, 
+      padreId: padreId ? padreId : null 
+    });
+    res.json({ exito: true, lugar: nuevoLugar });
+  } catch (error) {
+    res.status(400).json({ error: 'Error al crear el lugar: ' + error.message });
+  }
+});
+
+// Ruta para crear un nuevo Usuario
+app.post('/api/usuarios', async (req, res) => {
+  try {
+    const { nombre, uid, facultad, rol } = req.body;
+    const nuevoUsuario = await Usuario.create({ nombre, uid, facultad, rol });
+    res.json({ exito: true, usuario: nuevoUsuario });
+  } catch (error) {
+    // Manejo de error si el UID ya está registrado (es UNIQUE en la BD)
+    if (error.name === 'SequelizeUniqueConstraintError') {
+      return res.status(400).json({ error: 'Ese UID ya está registrado en otra tarjeta.' });
+    }
+    res.status(400).json({ error: 'Error al registrar usuario: ' + error.message });
+  }
 });
 
 // --- INICIAR SERVIDOR ---
 const PORT = 3000;
-sequelize.sync({ force: true }).then(async () => {
+// 5. force: false asegura que NO se borren tus datos al reiniciar el servidor.
+// Como quitamos los datos falsos, la BD iniciará en blanco la primera vez.
+sequelize.sync({ force: false }).then(() => {
   console.log('✅ Base de datos lista.');
 
-  // 1. Creamos la jerarquía
-  const campus = await Lugar.create({ nombre: 'Campus Principal', tipo: 'Campus' });
-  const facuIng = await Lugar.create({ nombre: 'Facultad de Ingeniería', tipo: 'Facultad', padreId: campus.id });
-  const facuArq = await Lugar.create({ nombre: 'Facultad de Arquitectura', tipo: 'Facultad', padreId: campus.id });
-  const labRedes = await Lugar.create({ nombre: 'Laboratorio de Redes', tipo: 'Salón', padreId: facuIng.id });
-
-  // 2. Metemos a los usuarios
-  const user1 = await Usuario.create({ nombre: 'Carlos Peréz', uid: '123456', facultad: 'Ingeniería', rol: 'Estudiante', UbicacionActualId: labRedes.id });
-  const user3 = await Usuario.create({ nombre: 'Omar Díaz Ventura', uid: 'B19CE268', facultad: 'Ingeniería', rol: 'Estudiante', UbicacionActualId: labRedes.id });
-  const user2 = await Usuario.create({ nombre: 'Laura Gonzalez', uid: '789012', facultad: 'Arquitectura', rol: 'Docente', UbicacionActualId: campus.id });
-
-  // 3. ¡NUEVO! Simulamos que pasaron sus tarjetas en los lectores
-  await Registro.create({ uid_leido: user1.uid, estado: 'Acceso Permitido', UsuarioId: user1.id, LugarId: labRedes.id });
-  await Registro.create({ uid_leido: user2.uid, estado: 'Acceso Permitido', UsuarioId: user2.id, LugarId: campus.id });
-  
-  // Simulamos a alguien que intentó entrar con una tarjeta no registrada
-  await Registro.create({ uid_leido: 'A1B2C3D4', estado: 'Acceso Denegado', UsuarioId: null, LugarId: facuIng.id });
-
-  app.listen(PORT, '0.0.0.0', () => console.log(`🚀 API lista en http://localhost:${PORT}`));
+  // 6. Usamos server.listen en lugar de app.listen para arrancar HTTP + WebSockets
+  server.listen(PORT, '0.0.0.0', () => console.log(`🚀 API y WebSockets listos en http://localhost:${PORT}`));
 });
