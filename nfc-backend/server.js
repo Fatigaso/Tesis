@@ -77,8 +77,9 @@ app.post('/api/verificar', async (req, res) => {
     // 2. Si la tarjeta no está registrada -> ACCESO DENEGADO
     if (!usuario) {
       await Registro.create({
-        usuarioId: null,
-        lugarId: lugarId || null,
+        uid_leido: uid,
+        UsuarioId: null, // <-- Con U Mayúscula
+        LugarId: lugarId || null, // <-- Con L Mayúscula
         estado: 'Acceso Denegado'
       });
       io.emit('nueva_lectura'); // Avisar al React
@@ -94,13 +95,9 @@ app.post('/api/verificar', async (req, res) => {
 
     // 3. LÓGICA DE ENTRADA Y SALIDA
     if (usuario.UbicacionActualId === lugar.id) {
-      // SI YA ESTABA AHÍ -> ES UNA SALIDA
       estadoRegistro = 'Salida';
-      // Magia de la jerarquía: Si sale del "Laboratorio", lo regresamos al "Campus" (padreId).
-      // Si sale del "Campus" (que no tiene padre), queda en null (Fuera del sistema).
       nuevaUbicacion = lugar.padreId; 
     } else {
-      // SI NO ESTABA AHÍ -> ES UNA ENTRADA
       estadoRegistro = 'Entrada';
       nuevaUbicacion = lugar.id;
     }
@@ -108,8 +105,9 @@ app.post('/api/verificar', async (req, res) => {
     // 4. Guardar los cambios en la base de datos
     await usuario.update({ UbicacionActualId: nuevaUbicacion });
     await Registro.create({
-      usuarioId: usuario.id,
-      lugarId: lugar.id,
+      uid_leido: uid,
+      UsuarioId: usuario.id, // <-- CORREGIDO: U Mayúscula
+      LugarId: lugar.id,     // <-- CORREGIDO: L Mayúscula
       estado: estadoRegistro
     });
 
